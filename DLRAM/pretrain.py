@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from transformers import BertModel, BertTokenizer, ViTModel, ViTImageProcessor
+from torch.cuda.amp import autocast, GradScaler
 from PIL import Image
 import os
 import json
@@ -16,6 +17,8 @@ from typing import Dict, List, Tuple, Optional
 import random
 import numpy as np
 from pathlib import Path
+from tqdm.auto import tqdm
+from datetime import datetime
 
 from utils import (
     get_token_positions,
@@ -51,6 +54,10 @@ class MultiModalEncoder(nn.Module):
         # 投影层 - 将特征映射到共享空间
         self.text_projection = nn.Linear(embedding_dim, projection_dim)
         self.visual_projection = nn.Linear(embedding_dim, projection_dim)
+
+        # 启动梯度检查点
+        self.text_encoder.gradient_checkpointing_enable()
+        self.visual_encoder.gradient_checkpointing_enable()
 
         # 温度参数
         self.temperature = nn.Parameter(torch.ones([]) * 0.07)
@@ -141,21 +148,29 @@ class TextImageDataset(Dataset):
         self.max_length = max_length
 
         # 加载正例和负例数据
+        print(f"Loading TextImage dataset from {positive_json} and {negative_json}...")
         with open(positive_json, 'r', encoding='utf-8') as f:
             self.positive_data = json.load(f)
         with open(negative_json, 'r', encoding='utf-8') as f:
             self.negative_data = json.load(f)
+        print(f"  Loaded {len(self.positive_data)} positive samples, {len(self.negative_data)} negative samples")
+
+        # 构建负例映射（统一img_id格式）
+        print("  Building negative sample mapping...")
+        negative_map = {}
+        for neg in tqdm(self.negative_data, desc="  Processing negatives", leave=False):
+            neg_img_id = self.normalize_img_id(neg['img_id'])
+            negative_map[neg_img_id] = neg
 
         # 构建索引映射
+        print("  Building data index...")
         self.data = []
-        for pos_item in self.positive_data:
+        for pos_item in tqdm(self.positive_data, desc="  Processing positives", leave=False):
             img_id = pos_item['img_id']
-            # 找到对应的负例
-            neg_item = None
-            for neg in self.negative_data:
-                if neg['img_id'] == img_id:
-                    neg_item = neg
-                    break
+            normalized_id = self.normalize_img_id(img_id)
+
+            # 从映射中找到对应的负例
+            neg_item = negative_map.get(normalized_id)
 
             if neg_item:
                 self.data.append({
@@ -163,15 +178,30 @@ class TextImageDataset(Dataset):
                     'img_id': img_id,
                     'mask_boxes': neg_item.get('mask_boxes', [])
                 })
+        print(f"  Built dataset with {len(self.data)} samples")
+
+        # 调试信息
+        if len(self.data) == 0:
+            print(f"警告: TextImageDataset 数据集为空!")
+            print(f"  正例数量: {len(self.positive_data)}")
+            print(f"  负例数量: {len(self.negative_data)}")
+            print(f"  负例映射键示例: {list(negative_map.keys())[:5]}")
+            if self.positive_data:
+                print(f"  正例img_id示例: {[p['img_id'] for p in self.positive_data[:3]]}")
 
     def __len__(self):
         return len(self.data)
 
+    @staticmethod
+    def normalize_img_id(img_id: str) -> str:
+        """统一img_id格式，去除IMGID:前缀"""
+        if img_id.startswith('IMGID:'):
+            return img_id.replace('IMGID:', '')
+        return img_id
+
     def img_id_to_filename(self, img_id: str) -> str:
         """将img_id转换为文件名"""
-        if img_id.startswith('IMGID:'):
-            return img_id.replace('IMGID:', '') + '.jpg'
-        return img_id + '.jpg'
+        return self.normalize_img_id(img_id) + '.jpg'
 
     def __getitem__(self, idx: int) -> Dict:
         item = self.data[idx]
@@ -207,24 +237,44 @@ class EntityObjectDataset(Dataset):
         self.max_length = max_length
 
         # 加载正例数据
+        print(f"Loading EntityObject dataset from {positive_json} and {negative_json}...")
         with open(positive_json, 'r', encoding='utf-8') as f:
             self.positive_data = json.load(f)
 
         # 加载负例数据并构建映射
         with open(negative_json, 'r', encoding='utf-8') as f:
             negative_data = json.load(f)
+        print(f"  Loaded {len(self.positive_data)} positive samples, {len(negative_data)} negative samples")
 
+        # 统一的img_id处理函数
+        def normalize_id(img_id: str) -> str:
+            if isinstance(img_id, str) and img_id.startswith('IMGID:'):
+                return img_id.replace('IMGID:', '')
+            return img_id
+
+        print("  Building negative sample mapping...")
         self.negative_map = {}
-        for neg_item in negative_data:
-            key = (neg_item['entity'], neg_item['positive_img_id'])
+        for neg_item in tqdm(negative_data, desc="  Processing negatives", leave=False):
+            key = (neg_item['entity'], normalize_id(neg_item['positive_img_id']))
             self.negative_map[key] = neg_item['negative_img_ids']
 
         # 过滤掉没有负例的数据
+        print("  Filtering positive samples...")
         self.data = []
-        for pos_item in self.positive_data:
-            key = (pos_item['entity'], pos_item['crop_img_id'])
+        for pos_item in tqdm(self.positive_data, desc="  Processing positives", leave=False):
+            key = (pos_item['entity'], normalize_id(pos_item['crop_img_id']))
             if key in self.negative_map:
                 self.data.append(pos_item)
+        print(f"  Built dataset with {len(self.data)} samples")
+
+        # 调试信息
+        if len(self.data) == 0:
+            print(f"警告: EntityObjectDataset 数据集为空!")
+            print(f"  正例数量: {len(self.positive_data)}")
+            print(f"  负例数量: {len(negative_data)}")
+            print(f"  负例映射键示例: {list(self.negative_map.keys())[:5]}")
+            if self.positive_data:
+                print(f"  正例键示例: {[(p['entity'], normalize_id(p['crop_img_id'])) for p in self.positive_data[:3]]}")
 
     def __len__(self):
         return len(self.data)
@@ -522,10 +572,28 @@ def train(
     save_dir: str = "./checkpoints",
     coarse_weight: float = 1.0,
     fine_weight: float = 1.0,
-    save_steps: int = 1000
+    save_steps: int = 1000,
+    log_file: str = "./training_log.txt"
 ):
     """训练循环"""
     os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(log_file) if os.path.dirname(log_file) else ".", exist_ok=True)
+
+    # 打开日志文件
+    log_f = open(log_file, 'w', encoding='utf-8')
+
+    def log_print(message: str):
+        """同时输出到控制台和日志文件"""
+        print(message)
+        log_f.write(message + '\n')
+        log_f.flush()
+
+    log_print(f"Training started at {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+    log_print(f"Total epochs: {num_epochs}")
+    log_print(f"Text-Image dataloader steps: {len(text_image_dataloader)}")
+    log_print(f"Entity-Object dataloader steps: {len(entity_object_dataloader)}")
+    log_print(f"Coarse weight: {coarse_weight}, Fine weight: {fine_weight}")
+    log_print("=" * 50)
 
     pretrainer = ContrastivePretrainer(
         model, device,
@@ -533,9 +601,15 @@ def train(
         fine_weight=fine_weight
     )
 
+    # 初始化混合精度训练的 GradScaler
+    scaler = GradScaler()
+
     global_step = 0
 
-    for epoch in range(num_epochs):
+    # 创建 epoch 级别的进度条
+    epoch_pbar = tqdm(range(num_epochs), desc="Training Epochs", position=0)
+
+    for epoch in epoch_pbar:
         model.train()
         text_image_loss_sum = 0.0
         entity_object_loss_sum = 0.0
@@ -548,46 +622,59 @@ def train(
         # 计算每个epoch的步数（取两者最大值）
         max_steps = max(len(text_image_dataloader), len(entity_object_dataloader))
 
-        for step in range(max_steps):
+        # 创建 step 级别的进度条
+        step_pbar = tqdm(range(max_steps), desc=f"Epoch {epoch}", position=1, leave=False)
+
+        for step in step_pbar:
             optimizer.zero_grad()
 
             total_loss = 0.0
 
-            # 1. 文本-图片层次训练
-            try:
-                batch_ti = next(text_image_iter)
-            except StopIteration:
-                text_image_iter = iter(text_image_dataloader)
-                batch_ti = next(text_image_iter)
+            # 使用 autocast 进行混合精度前向传播
+            with autocast():
+                # 1. 文本-图片层次训练
+                try:
+                    batch_ti = next(text_image_iter)
+                except StopIteration:
+                    text_image_iter = iter(text_image_dataloader)
+                    batch_ti = next(text_image_iter)
 
-            loss_ti = pretrainer.train_step_text_image(batch_ti)
-            total_loss += coarse_weight * loss_ti
-            text_image_loss_sum += loss_ti.item()
+                loss_ti = pretrainer.train_step_text_image(batch_ti)
+                total_loss += coarse_weight * loss_ti
+                text_image_loss_sum += loss_ti.item()
 
-            # 2. 实体-目标层次训练
-            try:
-                batch_eo = next(entity_object_iter)
-            except StopIteration:
-                entity_object_iter = iter(entity_object_dataloader)
-                batch_eo = next(entity_object_iter)
+                # 2. 实体-目标层次训练
+                try:
+                    batch_eo = next(entity_object_iter)
+                except StopIteration:
+                    entity_object_iter = iter(entity_object_dataloader)
+                    batch_eo = next(entity_object_iter)
 
-            loss_eo = pretrainer.train_step_entity_object(batch_eo)
-            total_loss += fine_weight * loss_eo
-            entity_object_loss_sum += loss_eo.item()
+                loss_eo = pretrainer.train_step_entity_object(batch_eo)
+                total_loss += fine_weight * loss_eo
+                entity_object_loss_sum += loss_eo.item()
 
-            # 反向传播
-            total_loss.backward()
-            optimizer.step()
+            # 使用 scaler 进行反向传播
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss_sum += total_loss.item()
             global_step += 1
 
-            # 打印日志
+            # 更新 step 进度条
+            step_pbar.set_postfix({
+                'total_loss': f'{total_loss.item():.4f}',
+                'ti_loss': f'{loss_ti.item():.4f}',
+                'eo_loss': f'{loss_eo.item():.4f}'
+            })
+
+            # 每10步打印一次日志
             if global_step % 10 == 0:
-                print(f"Epoch {epoch}, Step {global_step}, "
-                      f"Total Loss: {total_loss.item():.4f}, "
-                      f"TI Loss: {loss_ti.item():.4f}, "
-                      f"EO Loss: {loss_eo.item():.4f}")
+                log_print(f"Epoch {epoch}, Step {global_step}, "
+                          f"Total Loss: {total_loss.item():.4f}, "
+                          f"TI Loss: {loss_ti.item():.4f}, "
+                          f"EO Loss: {loss_eo.item():.4f}")
 
             # 保存检查点
             if global_step % save_steps == 0:
@@ -598,15 +685,31 @@ def train(
                     'optimizer_state_dict': optimizer.state_dict(),
                 }, os.path.join(save_dir, f"checkpoint_step_{global_step}.pt"))
 
-        # Epoch结束，打印平均损失
+        # 关闭 step 进度条
+        step_pbar.close()
+
+        # Epoch结束，计算平均损失
         avg_total_loss = total_loss_sum / max_steps
         avg_ti_loss = text_image_loss_sum / max_steps
         avg_eo_loss = entity_object_loss_sum / max_steps
 
-        print(f"\nEpoch {epoch} completed.")
-        print(f"  Average Total Loss: {avg_total_loss:.4f}")
-        print(f"  Average Text-Image Loss: {avg_ti_loss:.4f}")
-        print(f"  Average Entity-Object Loss: {avg_eo_loss:.4f}")
+        # 更新 epoch 进度条显示平均损失
+        epoch_pbar.set_postfix({
+            'avg_total': f'{avg_total_loss:.4f}',
+            'avg_ti': f'{avg_ti_loss:.4f}',
+            'avg_eo': f'{avg_eo_loss:.4f}'
+        })
+
+        tqdm.write(f"\nEpoch {epoch} completed.")
+        tqdm.write(f"  Average Total Loss: {avg_total_loss:.4f}")
+        tqdm.write(f"  Average Text-Image Loss: {avg_ti_loss:.4f}")
+        tqdm.write(f"  Average Entity-Object Loss: {avg_eo_loss:.4f}")
+
+        # 同时写入日志文件
+        log_print(f"\nEpoch {epoch} completed.")
+        log_print(f"  Average Total Loss: {avg_total_loss:.4f}")
+        log_print(f"  Average Text-Image Loss: {avg_ti_loss:.4f}")
+        log_print(f"  Average Entity-Object Loss: {avg_eo_loss:.4f}")
 
         # 保存epoch检查点
         torch.save({
@@ -616,7 +719,13 @@ def train(
             'optimizer_state_dict': optimizer.state_dict(),
         }, os.path.join(save_dir, f"checkpoint_epoch_{epoch}.pt"))
 
-    print("Training completed!")
+    # 关闭 epoch 进度条
+    epoch_pbar.close()
+    tqdm.write("Training completed!")
+    log_print("Training completed!")
+
+    # 关闭日志文件
+    log_f.close()
 
 
 def main():
@@ -648,8 +757,8 @@ def main():
 
     # 初始化模型
     model = MultiModalEncoder(
-        bert_model_name="bert-base-uncased",
-        vit_model_name="google/vit-base-patch16-224"
+        bert_model_name="./models/bert-base-uncased",
+        vit_model_name="./models/vit-base-patch16-224"
     )
 
     # 准备文本-图片层次数据
@@ -663,7 +772,7 @@ def main():
 
     text_image_dataloader = DataLoader(
         text_image_dataset,
-        batch_size=32,
+        batch_size=8,
         shuffle=True,
         collate_fn=lambda batch: collate_fn_text_image(batch, model.text_tokenizer, model.image_processor),
         num_workers=4
@@ -680,7 +789,7 @@ def main():
 
     entity_object_dataloader = DataLoader(
         entity_object_dataset,
-        batch_size=32,
+        batch_size=8,
         shuffle=True,
         collate_fn=lambda batch: collate_fn_entity_object(batch, model.text_tokenizer, model.image_processor),
         num_workers=4
@@ -688,6 +797,11 @@ def main():
 
     print(f"Text-Image dataset size: {len(text_image_dataset)}")
     print(f"Entity-Object dataset size: {len(entity_object_dataset)}")
+
+    # 生成带时间戳的日志文件名
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = f"./training_log_{timestamp}.txt"
+    print(f"Training log will be saved to: {log_file}")
 
     # 优化器
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
@@ -703,7 +817,8 @@ def main():
         save_dir="./checkpoints",
         coarse_weight=1.0,
         fine_weight=1.0,
-        save_steps=1000
+        save_steps=1000,
+        log_file=log_file
     )
 
 

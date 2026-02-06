@@ -337,8 +337,11 @@ def build_text_image_negatives(
     for npz_file in os.listdir(npz_dir):
         if npz_file.endswith('.npz'):
             npz_path = os.path.join(npz_dir, npz_file)
-            # 使用文件名（不含扩展名）作为键
-            key = Path(npz_file).stem
+            # 文件名格式: img_id.jpg.npz -> 提取 img_id (去除 .jpg.npz)
+            key = npz_file.replace('.jpg.npz', '').replace('.npz', '')
+            # 同时处理 IMGID: 前缀的情况
+            if key.startswith('IMGID:'):
+                key = key.replace('IMGID:', '')
             npz_data = np.load(npz_path, allow_pickle=True)
             npz_cache[key] = {
                 'boxes': npz_data['bounding_boxes'],
@@ -351,7 +354,8 @@ def build_text_image_negatives(
 
     for item in data:
         img_id = item['img_id']
-        img_stem = img_id_to_filename(img_id).replace('.jpg', '')
+        # 统一img_id格式: 去除IMGID:前缀，得到纯数字ID
+        img_stem = img_id_to_filename(img_id).replace('.jpg', '').replace('IMGID:', '')
 
         # 检查是否有对应的NPZ文件
         if img_stem not in npz_cache:
