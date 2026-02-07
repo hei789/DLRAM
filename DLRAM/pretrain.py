@@ -573,11 +573,19 @@ def train(
     coarse_weight: float = 1.0,
     fine_weight: float = 1.0,
     save_steps: int = 1000,
-    log_file: str = "./training_log.txt"
+    log_file: str = "./training_log.txt",
+    save_best_only: bool = True
 ):
-    """训练循环"""
+    """训练循环
+
+    Args:
+        save_best_only: 如果为True，只保存验证损失最好的模型；否则按save_steps间隔保存
+    """
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(os.path.dirname(log_file) if os.path.dirname(log_file) else ".", exist_ok=True)
+
+    # 跟踪最佳损失
+    best_loss = float('inf')
 
     # 打开日志文件
     log_f = open(log_file, 'w', encoding='utf-8')
@@ -676,8 +684,8 @@ def train(
                           f"TI Loss: {loss_ti.item():.4f}, "
                           f"EO Loss: {loss_eo.item():.4f}")
 
-            # 保存检查点
-            if global_step % save_steps == 0:
+            # 保存检查点（仅在非save_best_only模式下按步保存）
+            if not save_best_only and global_step % save_steps == 0:
                 torch.save({
                     'epoch': epoch,
                     'global_step': global_step,
@@ -711,13 +719,29 @@ def train(
         log_print(f"  Average Text-Image Loss: {avg_ti_loss:.4f}")
         log_print(f"  Average Entity-Object Loss: {avg_eo_loss:.4f}")
 
-        # 保存epoch检查点
-        torch.save({
-            'epoch': epoch,
-            'global_step': global_step,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-        }, os.path.join(save_dir, f"checkpoint_epoch_{epoch}.pt"))
+        # 保存检查点
+        if save_best_only:
+            # 只保存最好的模型
+            if avg_total_loss < best_loss:
+                best_loss = avg_total_loss
+                best_checkpoint_path = os.path.join(save_dir, "best_checkpoint.pt")
+                torch.save({
+                    'epoch': epoch,
+                    'global_step': global_step,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_loss': best_loss,
+                }, best_checkpoint_path)
+                tqdm.write(f"  New best model saved! Best loss: {best_loss:.4f}")
+                log_print(f"  New best model saved! Best loss: {best_loss:.4f}")
+        else:
+            # 保存epoch检查点
+            torch.save({
+                'epoch': epoch,
+                'global_step': global_step,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, os.path.join(save_dir, f"checkpoint_epoch_{epoch}.pt"))
 
     # 关闭 epoch 进度条
     epoch_pbar.close()
@@ -818,7 +842,8 @@ def main():
         coarse_weight=1.0,
         fine_weight=1.0,
         save_steps=1000,
-        log_file=log_file
+        log_file=log_file,
+        save_best_only=True  # 只保存最好的模型
     )
 
 
