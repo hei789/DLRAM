@@ -1,0 +1,384 @@
+================================================================================
+H-Index 自定义编码器修改指南
+================================================================================
+
+本指南专门针对：使用自定义文本编码器和视觉编码器替换原有编码器
+
+================================================================================
+一、快速定位修改点
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  修改点1: 视觉特征输入 (data_pipe.py)                                        │
+│  作用: 替换VinVL预提取特征为你自己的视觉编码器在线提取                        │
+│  行号: 127-140                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  修改点2: 视觉特征投影层 (modeing_bart_multi_concat.py)                      │
+│  作用: 修改投影层输入维度以匹配你的视觉特征维度                               │
+│  行号: 311                                                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  修改点3: 文本+视觉编码器 (modeing_bart_multi_concat.py)                     │
+│  作用: 替换BART Encoder为你自己的文本编码器                                   │
+│  行号: 278-389 (BartEncoder类)                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  修改点4: 数据Pipe参数 (data_pipe.py)                                        │
+│  作用: 调整视觉特征维度参数                                                   │
+│  行号: 44-46 (BartNERPipe.__init__)                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+二、详细修改步骤
+================================================================================
+
+【步骤1】修改视觉特征维度参数
+--------------------------------------------------------------------------------
+文件: model/data_pipe.py
+位置: 第44-46行
+
+原代码:
+    self.max_bbox = max_bbox  # 默认16
+    self.max_aspect = 6
+    self.region_dim = 2048    # VinVL特征维度
+
+修改: 根据你的视觉编码器输出维度调整
+    self.max_bbox = max_bbox  # 你的视觉编码器输出区域数
+    self.region_dim = your_dim  # 如: 768 (CLIP), 1024 (ViT)等
+
+--------------------------------------------------------------------------------
+
+【步骤2】替换视觉特征加载方式
+--------------------------------------------------------------------------------
+文件: model/data_pipe.py
+位置: 第127-140行 (prepare_target函数内)
+
+原代码:
+    if self.image_feature_path:
+        try:
+            img=np.load(os.path.join(self.image_feature_path,str(img_id)+'.jpg.npz'))
+            image_num = img['num_boxes']
+            image_feature_ = img['box_features']  # (num_boxes, 2048)
+            if self.normalize:
+                image_feature_ = (image_feature_/np.sqrt((image_feature_**2).sum()))
+            final_num = min(image_num,self.max_bbox)
+            image_feature[:final_num] = image_feature_[:final_num]
+            image_boxes[:final_num] = img['bounding_boxes'][:final_num]
+        except:
+            print("no image feature"+str(img_id))
+
+修改为你的视觉编码器:
+
+    # 示例: 使用CLIP作为视觉编码器
+    from PIL import Image
+    import torch.nn.functional as F
+
+    # 1. 加载并预处理图像
+    image_path = os.path.join(self.image_dir, str(img_id) + '.jpg')
+    image = Image.open(image_path).convert('RGB')
+    image_input = self.clip_processor(image).unsqueeze(0)  # (1, 3, 224, 224)
+
+    # 2. 使用视觉编码器提取特征
+    with torch.no_grad():
+        # CLIP输出可能是 (1, 512) 全局特征 或需要提取区域特征
+        visual_features = self.visual_encoder(image_input)  # 根据你的编码器调整
+
+        # 如果需要提取区域特征，可以使用ROI Align或类似方法
+        # 或者使用目标检测器先提取区域再编码
+
+    # 3. 调整维度
+    final_num = min(visual_features.size(0), self.max_bbox)
+    image_feature[:final_num] = visual_features[:final_num].cpu().numpy()
+
+--------------------------------------------------------------------------------
+
+【步骤3】修改视觉特征投影层
+--------------------------------------------------------------------------------
+文件: model/modeing_bart_multi_concat.py
+位置: 第311行
+
+原代码:
+    self.img_proj = nn.Linear(2048, config.d_model)
+
+修改为你的视觉特征维度:
+    self.img_proj = nn.Linear(your_visual_dim, config.d_model)
+    # 例如 CLIP: nn.Linear(512, 768) 或 ViT: nn.Linear(768, 768)
+
+--------------------------------------------------------------------------------
+
+【步骤4】替换文本编码器 (最复杂)
+--------------------------------------------------------------------------------
+文件: model/modeing_bart_multi_concat.py
+位置: 第278-389行 (BartEncoder类)
+
+【方案A】简单替换 - 保持BART结构，只替换内部层
+
+class BartEncoder(nn.Module):
+    def __init__(self, config, embed_tokens, custom_encoder=None):
+        super().__init__()
+        # ... 保留原有代码 ...
+
+        # 替换编码层
+        if custom_encoder is not None:
+            self.custom_encoder = custom_encoder
+            self.use_custom = True
+        else:
+            self.layers = nn.ModuleList([EncoderLayer(config) ...])
+            self.use_custom = False
+
+        # ... 保留img_proj等 ...
+
+    def forward(self, input_ids, image_feature, attention_mask=None, ...):
+        # 1. 文本嵌入 (保留)
+        inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
+        embed_pos = self.embed_positions(input_ids)
+        x = inputs_embeds + embed_pos
+        x = self.layernorm_embedding(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # 2. 使用自定义编码器 (新增)
+        if self.use_custom:
+            # 你的编码器输入输出应该是 (batch, seq_len, hidden_dim)
+            x = self.custom_encoder(x, attention_mask)
+            # 如果需要调整维度:
+            # x = self.dim_adapter(x)  # 如: Linear(1024, 768)
+        else:
+            # 原有BART层
+            x = x.transpose(0, 1)  # (seq_len, batch, hidden)
+            for encoder_layer in self.layers:
+                x, _ = encoder_layer(x, attention_mask)
+            x = x.transpose(0, 1)  # (batch, seq_len, hidden)
+
+        # 3. 视觉特征融合 (保留)
+        img_feat_ = self.img_proj(image_feature)  # (batch, box_num, hidden)
+        x = torch.cat((img_feat_, x), dim=1)      # (batch, box_num+seq_len, hidden)
+        attention_mask = torch.cat((image_mask, attention_mask), dim=-1)
+
+        # 4. 返回 (保留接口不变)
+        return img_feat_, BaseModelOutput(...)
+
+
+【方案B】完全替换 - 使用HuggingFace编码器
+
+from transformers import AutoModel, AutoTokenizer
+
+class BartEncoder(nn.Module):
+    def __init__(self, config, embed_tokens):
+        super().__init__()
+
+        # 加载你的文本编码器
+        self.text_encoder = AutoModel.from_pretrained('your-model-name')
+
+        # 维度适配 (如果需要)
+        text_hidden_size = self.text_encoder.config.hidden_size
+        if text_hidden_size != config.d_model:
+            self.text_dim_adapter = nn.Linear(text_hidden_size, config.d_model)
+        else:
+            self.text_dim_adapter = None
+
+        # 视觉投影层
+        self.img_proj = nn.Linear(your_visual_dim, config.d_model)
+
+    def forward(self, input_ids, image_feature, ...):
+        # 1. 使用自定义文本编码器
+        text_outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        x = text_outputs.last_hidden_state  # (batch, seq_len, text_hidden)
+
+        # 2. 维度适配
+        if self.text_dim_adapter is not None:
+            x = self.text_dim_adapter(x)  # (batch, seq_len, d_model)
+
+        # 3. 视觉特征投影和融合 (同方案A)
+        img_feat_ = self.img_proj(image_feature)
+        x = torch.cat((img_feat_, x), dim=1)
+
+        return img_feat_, BaseModelOutput(last_hidden_state=x, ...)
+
+--------------------------------------------------------------------------------
+
+【步骤5】修改模型构建函数
+--------------------------------------------------------------------------------
+文件: model/bart_multi_concat.py
+位置: 第271-310行 (build_model方法)
+
+如果完全替换了BART Encoder，需要修改build_model:
+
+原代码:
+    model = BartModel.from_pretrained(bart_model)
+    encoder = model.encoder
+    decoder = model.decoder
+
+修改:
+    # 1. 加载BART用于获取decoder和词嵌入
+    bart_model = BartModel.from_pretrained(bart_model)
+
+    # 2. 使用自定义encoder替换
+    from .custom_encoder import YourCustomEncoder  # 你的编码器
+    encoder = YourCustomEncoder(bart_model.config, bart_model.encoder.embed_tokens)
+
+    # 3. 保持decoder不变
+    decoder = bart_model.decoder
+
+    # 4. 后续代码基本不变...
+
+================================================================================
+三、关键接口要求
+================================================================================
+
+无论你如何修改，以下接口必须保持一致：
+
+【BartEncoder.forward输出】
+必须返回4个值:
+    1. img_feat_: Tensor (batch, box_num, hidden_dim) - 投影后的视觉特征
+    2. encoder_outputs: BaseModelOutput - 包含last_hidden_state等
+    3. multi_modal_mask: Tensor (batch, box_num+seq_len) - 注意力掩码
+    4. hidden_states: tuple - 包含输入嵌入层输出 (用于decoder的copy机制)
+
+【输入参数】
+    - input_ids: (batch, seq_len)
+    - image_feature: (batch, box_num, region_dim)
+    - attention_mask: (batch, seq_len)
+    - image_mask: (batch, box_num)
+
+【输出维度】
+    - last_hidden_state: (batch, box_num+seq_len, d_model)
+    - d_model必须与BART Decoder输入维度一致 (768或1024)
+
+================================================================================
+四、常见修改场景示例
+================================================================================
+
+【场景1】使用CLIP作为视觉编码器，BART作为文本编码器
+--------------------------------------------------------------------------------
+- 保持文本编码器不变
+- 修改data_pipe.py加载CLIP特征
+- 修改img_proj输入维度: 512 -> 768
+
+【场景2】使用DeBERTa替换BART Encoder
+--------------------------------------------------------------------------------
+- 加载DeBERTa模型
+- 添加维度适配层: 768 -> 768 (如果相同则不需要)
+- 保持视觉处理和Decoder不变
+
+【场景3】使用ViT提取图像区域特征
+--------------------------------------------------------------------------------
+- 使用目标检测器提取区域
+- 使用ViT编码每个区域
+- 修改img_proj: 768 -> 768 (ViT输出通常768维)
+
+【场景4】完全自定义多模态编码器
+--------------------------------------------------------------------------------
+- 实现新的BartEncoder类
+- 实现文本编码 (如BERT)
+- 实现视觉编码 (如ResNet)
+- 实现多模态融合 (如Cross-Attention)
+- 确保输出接口兼容
+
+================================================================================
+五、调试检查清单
+================================================================================
+
+在修改后，检查以下几点：
+
+□ 1. 文本编码器输出维度是否与BART Decoder输入维度一致
+   - 检查点: print(encoder_outputs.shape) 应该是 (batch, box_num+seq_len, 768/1024)
+
+□ 2. 视觉特征投影是否正确
+   - 检查点: img_feat_.shape 应该是 (batch, box_num, 768/1024)
+
+□ 3. 多模态融合后的序列长度是否正确
+   - 检查点: encoder_outputs.shape[1] 应该等于 box_num + text_seq_len
+
+□ 4. 注意力掩码维度是否匹配
+   - 检查点: multi_modal_mask.shape 应该与 encoder_outputs.shape[:2] 一致
+
+□ 5. decoder是否能正常生成
+   - 检查点: 运行model.forward(...)看是否能正常输出
+
+================================================================================
+六、推荐修改顺序
+================================================================================
+
+第一步: 先单独测试视觉编码器
+    - 修改data_pipe.py加载你的视觉特征
+    - 修改img_proj维度
+    - 确保训练能正常进行
+
+第二步: 再替换文本编码器
+    - 实现新的BartEncoder类
+    - 保持接口兼容
+    - 逐步调试确保输出正确
+
+第三步: 联合训练
+    - 可以先冻结新编码器，只训练融合层和解码器
+    - 然后端到端微调
+
+================================================================================
+七、相关文件快速导航
+================================================================================
+
+model/
+├── modeing_bart_multi_concat.py  # 编码器核心 (修改点2,3)
+│   ├── BartEncoder (278-389行)   # 文本+视觉编码
+│   ├── BartDecoder (483-636行)   # 解码器 (通常不需要修改)
+│   └── img_proj (311行)          # 视觉投影层
+│
+├── bart_multi_concat.py          # 模型封装 (修改点5)
+│   ├── FBartEncoder (17-32行)    # 编码器包装
+│   ├── CaGFBartDecoder (142-266) # 实际使用的解码器
+│   └── build_model (271-310行)   # 模型构建
+│
+├── data_pipe.py                  # 数据加载 (修改点1,4)
+│   ├── BartNERPipe.__init__ (21-59行)
+│   └── prepare_target (119-277行) # 视觉特征加载
+│
+└── generater_multi_concat.py     # 生成器 (通常不需要修改)
+
+train.py                          # 训练入口
+    - 第116行: 模型构建
+    - 第171-172行: 数据输入
+
+================================================================================
+八、注意事项
+================================================================================
+
+1. **预训练权重问题**
+   - 替换文本编码器后，BART预训练权重不能直接加载
+   - 需要重新训练或使用新编码器的预训练权重
+
+2. **梯度流动**
+   - 确保新编码器的参数可以正常计算梯度
+   - 检查requires_grad=True
+
+3. **设备问题**
+   - 确保自定义编码器的参数也在正确设备上
+   - 使用model.to(device)会自动处理
+
+4. **序列长度**
+   - 不同编码器可能有不同的最大序列长度限制
+   - 注意调整max_position_embeddings
+
+5. **Tokenizer一致性**
+   - 如果替换文本编码器，需要相应替换Tokenizer
+   - 在data_pipe.py和train.py中统一修改
+
+================================================================================
+九、获取帮助
+================================================================================
+
+详细代码解读请参考: H-Index代码解读.txt
+
+关键行号速查:
+- 视觉特征加载: data_pipe.py:127
+- 视觉投影层: modeing_bart_multi_concat.py:311
+- 文本编码器: modeing_bart_multi_concat.py:278
+- 多模态融合: modeing_bart_multi_concat.py:349
+- 模型构建: bart_multi_concat.py:271
+
+================================================================================
+文档生成时间: 2026年2月
+================================================================================

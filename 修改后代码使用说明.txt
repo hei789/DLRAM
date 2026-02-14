@@ -1,0 +1,301 @@
+================================================================================
+H-Index 修改版使用说明 (BERT + ViT)
+================================================================================
+
+本代码库已修改为使用以下编码器：
+- 文本编码器: BERT-Base (bert-base-uncased)
+- 视觉编码器: ViT-B/16 (google/vit-base-patch16-224)
+
+支持从本地文件夹加载预训练权重，无需自动下载。
+
+================================================================================
+一、修改内容概述
+================================================================================
+
+【修改文件1】model/data_pipe.py
+  - 添加ViT视觉编码器在线特征提取
+  - 修改BartNERPipe类支持ViT
+  - 视觉特征维度从2048改为768
+  - 支持从本地路径加载ViT权重
+
+【修改文件2】model/modeing_bart_multi_concat.py
+  - BartEncoder类添加BERT支持
+  - 修改img_proj输入维度为768 (匹配ViT输出)
+  - 使用BERT-Base替换BART Encoder
+  - 支持从本地路径加载BERT权重
+
+【修改文件3】model/bart_multi_concat.py
+  - 修改build_model支持use_bert, bert_model_name, bert_model_path参数
+
+【修改文件4】train.py
+  - 添加命令行参数: --image_dir, --use_bert, --bert_model_name, --bert_model_path
+  - 添加命令行参数: --use_vit, --vit_model_name, --vit_model_path
+  - 调整device初始化顺序
+
+================================================================================
+二、环境要求
+================================================================================
+
+# 基础依赖（与原代码相同）
+- pytorch 1.7.1+
+- transformers 4.20+ (需要支持ViT)
+- fastnlp 0.6.0
+
+# 安装transformers
+pip install transformers>=4.20.0
+
+# 本地权重文件夹结构要求:
+# BERT文件夹下应包含: config.json, pytorch_model.bin, vocab.txt 等
+# ViT文件夹下应包含: config.json, pytorch_model.bin, preprocessor_config.json 等
+
+================================================================================
+三、本地权重文件夹结构
+================================================================================
+
+【BERT本地权重文件夹】
+/path/to/your/bert/
+├── config.json              # BERT配置文件
+├── pytorch_model.bin        # BERT权重文件
+└── vocab.txt                # 词表文件
+
+【ViT本地权重文件夹】
+/path/to/your/vit/
+├── config.json              # ViT配置文件
+├── pytorch_model.bin        # ViT权重文件
+└── preprocessor_config.json # 图像处理器配置文件
+
+================================================================================
+四、训练命令
+================================================================================
+
+【使用本地BERT和ViT权重训练】
+
+python train.py \
+    --bart_name facebook/bart-large \
+    --datapath ./Twitter_GMNER/txt/ \
+    --image_dir ./Twitter_GMNER/images/ \
+    --image_annotation_path ./Twitter_GMNER/xml/ \
+    --box_num 16 \
+    --batch_size 8 \
+    --lr 1e-5 \
+    --n_epochs 30 \
+    --max_len 30 \
+    --region_loss_ratio 1.0 \
+    --decoder_type avg_feature \
+    --use_bert True \
+    --bert_model_path /path/to/your/bert/ \
+    --use_vit True \
+    --vit_model_path /path/to/your/vit/
+
+【混合使用：本地BERT + HuggingFace ViT】
+
+python train.py \
+    --bart_name facebook/bart-large \
+    --datapath ./Twitter_GMNER/txt/ \
+    --image_dir ./Twitter_GMNER/images/ \
+    --image_annotation_path ./Twitter_GMNER/xml/ \
+    --box_num 16 \
+    --batch_size 8 \
+    --use_bert True \
+    --bert_model_path /path/to/your/bert/ \
+    --use_vit True \
+    --vit_model_name google/vit-base-patch16-224
+    # 不指定vit_model_path，会自动从HuggingFace下载ViT
+
+【使用VinVL特征（原方法）】
+
+python train.py \
+    --bart_name facebook/bart-large \
+    --datapath ./Twitter_GMNER/txt/ \
+    --image_feature_path ./data/Twitter_GMNER_vinvl \
+    --image_annotation_path ./Twitter_GMNER/xml/ \
+    --box_num 16 \
+    --use_vit False \
+    --use_bert False
+
+================================================================================
+五、参数说明
+================================================================================
+
+【新增参数 - 本地权重】
+
+--bert_model_path
+  BERT本地权重文件夹路径
+  默认: None (从HuggingFace自动下载)
+  示例: --bert_model_path /home/user/models/bert-base-uncased/
+
+--vit_model_path
+  ViT本地权重文件夹路径
+  默认: None (从HuggingFace自动下载)
+  示例: --vit_model_path /home/user/models/vit-base-patch16-224/
+
+【其他新增参数】
+
+--image_dir
+  原始图像文件夹路径（ViT需要）
+  默认: ./Twitter_GMNER/images/
+
+--use_bert
+  是否使用BERT作为文本编码器
+  默认: True
+
+--bert_model_name
+  BERT预训练模型名称（当bert_model_path为None时使用）
+  默认: bert-base-uncased
+
+--use_vit
+  是否使用ViT作为视觉编码器
+  默认: True
+
+--vit_model_name
+  ViT预训练模型名称（当vit_model_path为None时使用）
+  默认: google/vit-base-patch16-224
+
+【原有常用参数】
+
+--bart_name
+  BART模型名称（用于Decoder和Tokenizer）
+  默认: facebook/bart-large
+
+--box_num
+  视觉区域数量（ViT使用16个patch）
+  默认: 16
+
+--batch_size
+  批次大小（根据显存调整）
+  默认: 16
+
+--lr
+  学习率
+  默认: 1e-5
+
+--n_epochs
+  训练轮数
+  默认: 30
+
+================================================================================
+六、显存需求
+================================================================================
+
+由于同时使用BERT和ViT，显存需求会增加:
+
+- BERT-Base: ~440MB
+- ViT-B/16: ~330MB
+- BART Decoder: ~1.5GB (bart-large)
+
+建议显存配置:
+- batch_size=8: 需要约 10GB 显存
+- batch_size=16: 需要约 16GB 显存
+
+如果显存不足，可以:
+1. 减小 --batch_size
+2. 使用更小的BART: --bart_name facebook/bart-base
+
+================================================================================
+七、常见问题
+================================================================================
+
+Q1: 如何准备本地BERT权重文件夹？
+A: 从HuggingFace下载后复制到本地，或使用 transformers 库的 save_pretrained 方法保存:
+   ```python
+   from transformers import BertModel
+   model = BertModel.from_pretrained('bert-base-uncased')
+   model.save_pretrained('/path/to/your/bert/')
+   ```
+
+Q2: 如何准备本地ViT权重文件夹？
+A: 同样使用 save_pretrained 方法:
+   ```python
+   from transformers import AutoModel, AutoImageProcessor
+   model = AutoModel.from_pretrained('google/vit-base-patch16-224')
+   processor = AutoImageProcessor.from_pretrained('google/vit-base-patch16-224')
+   model.save_pretrained('/path/to/your/vit/')
+   processor.save_pretrained('/path/to/your/vit/')
+   ```
+
+Q3: 报错 "OSError: Error no file named pytorch_model.bin found"
+A: 本地权重文件夹中缺少必要的权重文件，请检查路径是否正确，文件是否存在。
+
+Q4: 报错 "No such file or directory: './Twitter_GMNER/images/xxx.jpg'"
+A: 请检查 --image_dir 参数是否正确指向图像文件夹
+
+Q5: 可以使用BERT- Large吗？
+A: 可以，但需要相应调整batch_size以避免显存溢出:
+   --bert_model_path /path/to/bert-large/
+
+Q6: 如何使用中文BERT？
+A: 提供中文BERT本地路径即可:
+   --bert_model_path /path/to/chinese-bert/
+   注意：需要对应的中文数据集和Tokenizer
+
+Q7: 可以使用其他视觉编码器（如Swin Transformer）吗？
+A: 可以，修改代码中ViT相关部分，调整特征维度和处理方式即可。
+
+================================================================================
+八、模型结构说明
+================================================================================
+
+修改后的模型结构:
+
+输入图文对
+    ↓
+文本 → BERT-Base Encoder → 文本特征 (768维)
+图像 → ViT-B/16 → 全局特征 → 采样为16个区域特征 (768维)
+    ↓
+特征拼接: [视觉特征; 文本特征] (batch, 16+seq_len, 768)
+    ↓
+投影层: Linear(768, 1024) 匹配BART Decoder维度
+    ↓
+BART Decoder (生成式解码)
+    ↓
+输出: 实体序列 + 区域选择
+
+================================================================================
+九、完整示例
+================================================================================
+
+假设你的权重文件夹结构如下:
+
+/home/user/models/
+├── bert-base-uncased/
+│   ├── config.json
+│   ├── pytorch_model.bin
+│   └── vocab.txt
+└── vit-base-patch16-224/
+    ├── config.json
+    ├── pytorch_model.bin
+    └── preprocessor_config.json
+
+训练命令:
+
+python train.py \
+    --bart_name facebook/bart-large \
+    --datapath ./Twitter_GMNER/txt/ \
+    --image_dir ./Twitter_GMNER/images/ \
+    --image_annotation_path ./Twitter_GMNER/xml/ \
+    --box_num 16 \
+    --batch_size 8 \
+    --lr 1e-5 \
+    --n_epochs 30 \
+    --use_bert True \
+    --bert_model_path /home/user/models/bert-base-uncased/ \
+    --use_vit True \
+    --vit_model_path /home/user/models/vit-base-patch16-224/
+
+================================================================================
+十、版本信息
+================================================================================
+
+修改日期: 2026年2月
+修改内容:
+- 文本编码器: BART Encoder → BERT-Base (支持本地权重)
+- 视觉编码器: VinVL预提取特征 → ViT-B/16在线提取 (支持本地权重)
+- 特征维度: 2048 → 768
+
+================================================================================
+如有问题，请检查:
+1. 本地权重文件夹路径是否正确
+2. 权重文件是否完整 (config.json, pytorch_model.bin等)
+3. 图像路径是否正确
+4. 显存是否充足
+================================================================================
